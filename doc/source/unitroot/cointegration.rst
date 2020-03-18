@@ -13,3 +13,5 @@ Cointegration Tests
    DynamicOLSResults
    engle_granger
    EngleGrangerCointegrationTestResult
+   phillips_ouliaris
+   PhillipsOuliarisCointegrationTestResult

@@ -30,6 +30,8 @@ __all__ = [
     "engle_granger_pval",
     "DynamicOLS",
     "DynamicOLSResults",
+    "phillips_ouliaris",
+    "PhillipsOuliarisCointegrationTestResult",
 ]
 
 try:
@@ -42,6 +44,8 @@ KERNEL_ESTIMATORS: Dict[str, Type[lrcov.CovarianceEstimator]] = {
     kernel.lower(): getattr(lrcov, kernel) for kernel in lrcov.KERNELS
 }
 KERNEL_ESTIMATORS.update({kernel: getattr(lrcov, kernel) for kernel in lrcov.KERNELS})
+KNOWN_KERNELS = "\n".join(sorted([k for k in KERNEL_ESTIMATORS]))
+KERNEL_ERR = f"kernel is not a known estimator. Must be one of:\n {KNOWN_KERNELS}"
 
 
 def _cross_section(y: ArrayLike1D, x: ArrayLike2D, trend: str) -> RegressionResults:
@@ -137,6 +141,216 @@ def engle_granger(
     )
 
 
+def _po_ptests(
+    z: pd.DataFrame,
+    xsection: RegressionResults,
+    trend: str,
+    stat: str,
+    kernel: str,
+    bandwidth: Optional[int],
+    force_int: bool,
+) -> "PhillipsOuliarisCointegrationTestResult":
+    nobs = z.shape[0]
+    z_lead = z.iloc[1:]
+    z_lag = add_trend(z.iloc[:-1], trend=trend)
+    phi = np.linalg.lstsq(z_lag, z_lead, rcond=None)[0]
+    xi = z_lead - np.asarray(z_lag @ phi)
+
+    ker_est = KERNEL_ESTIMATORS[kernel]
+    cov_est = ker_est(xi, bandwidth=bandwidth, center=False, force_int=force_int)
+    cov = cov_est.cov
+    omega = np.asarray(cov.long_run)
+
+    if stat == "pu":
+        u = np.asarray(xsection.resid)
+        denom = u.T @ u / nobs
+        omega21 = omega[0, 1:]
+        omega22 = omega[1:, 1:]
+        omega22_inv = np.linalg.inv(omega22)
+        omega112 = omega[0, 0] - np.squeeze(omega21.T @ omega22_inv @ omega21)
+        test_stat = nobs * float(np.squeeze(omega112 / denom))
+    else:
+        # returning p_z
+        _z = np.asarray(z)
+        if trend != "n":
+            tr = add_trend(nobs=_z.shape[0], trend=trend)
+            _z = _z - tr @ np.linalg.lstsq(tr, _z, rcond=None)[0]
+        m_zz = _z.T @ _z / nobs
+        test_stat = nobs * float(np.squeeze((omega @ np.linalg.inv(m_zz)).trace()))
+    # TODO: CV and Pvalue
+    cv = pd.Series([], name="critical_value")
+    return PhillipsOuliarisCointegrationTestResult(
+        test_stat,
+        np.nan,
+        cv,
+        order=z.shape[1],
+        xsection=xsection,
+        test_type=stat,
+        kernel_est=cov_est,
+    )
+
+
+def _po_ztests(
+    xsection: RegressionResults,
+    stat: str,
+    kernel: str,
+    bandwidth: Optional[int],
+    force_int: bool,
+) -> "PhillipsOuliarisCointegrationTestResult":
+    # Za and Zt tests
+    u = np.asarray(xsection.resid)[:, None]
+    nobs = u.shape[0]
+    alpha = np.linalg.lstsq(u[:-1], u[1:, 0], rcond=None)[0]
+    k = u[1:] - alpha * u[:-1]
+    u2 = np.squeeze(u[:-1].T @ u[:-1])
+    kern_est = KERNEL_ESTIMATORS[kernel]
+    cov_est = kern_est(k, bandwidth=bandwidth, center=False, force_int=force_int)
+    cov = cov_est.cov
+    one_sided_strict = cov.one_sided_strict
+
+    z = float(np.squeeze((alpha - 1) - nobs * one_sided_strict / u2))
+    if stat == "za":
+        test_stat = nobs * z
+    else:
+        long_run = np.squeeze(cov.long_run)
+        test_stat = np.sqrt(u2) * z / long_run
+    # TODO: CV and Pvalue
+    cv = pd.Series([], name="critical_value")
+    x = xsection.model.exog
+    return PhillipsOuliarisCointegrationTestResult(
+        test_stat,
+        np.nan,
+        cv,
+        order=x.shape[1] + 1,
+        xsection=xsection,
+        test_type=stat,
+        kernel_est=cov_est,
+    )
+
+
+def phillips_ouliaris(
+    y: ArrayLike1D,
+    x: ArrayLike2D,
+    trend: str = "c",
+    *,
+    test_type: str = "Zt",
+    kernel: str = "bartlett",
+    bandwidth: Optional[int] = None,
+    force_int: bool = False,
+) -> "PhillipsOuliarisCointegrationTestResult":
+    r"""
+    Test for cointegration within a set of time series.
+
+    Parameters
+    ----------
+    y : array_like
+        The left-hand-side variable in the cointegrating regression.
+    x : array_like
+        The right-hand-side variables in the cointegrating regression.
+    trend : {"n","c","ct","ctt"}, default "c"
+        Trend to include in the cointegrating regression. Trends are:
+
+        * "n": No deterministic terms
+        * "c": Constant
+        * "ct": Constant and linear trend
+        * "ctt": Constant, linear and quadratic trends
+    test_type : {"Za", "Zt", "Pu", "Pz"}, default "Zt"
+        The test statistic to compute. Supported options are:
+
+        * "Za": The Zα test based on the the debiased AR(1) coefficient.
+        * "Zt": The Zt test based on the t-statistic from an AR(1).
+        * "Pu": The Pᵤ variance-ratio test.
+        * "Pz": The Pz test of the trace of the product of an estimate of the
+          long-run residual variance and the inner-product of the data.
+
+        See the notes for details on the test.
+    kernel : str, default "bartlett"
+        The string name of any of any known kernel-based long-run
+        covariance estimators. Common choices are "bartlett" for the
+        Bartlett kernel (Newey-West), "parzen" for the Parzen kernel
+        and "quadratic-spectral" for Quadratic Spectral kernel.
+    bandwidth : int, default None
+        The bandwidth to use. If not provided, the optimal bandwidth is
+        estimated from the data. Setting the bandwidth to 0 and using
+        "unadjusted" produces the classic OLS covariance estimator.
+        Setting the bandwidth to 0 and using "robust" produces White's
+        covariance estimator.
+    force_int : bool, default False
+        Whether the force the estimated optimal bandwidth to be an integer.
+
+    Returns
+    -------
+    PhillipsOuliarisCointegrationTestResult
+        Results of the Phillips-Ouliaris test.
+
+    Notes
+    -----
+    Supports 4 distinct tests.
+
+    The Zα and Zt statistics are defined as
+
+    .. math::
+
+       Z_\alpha & = T \times z \\
+       Z_t & =  \sqrt{\sum_{t=2}^T \hat{u}^2} z / \hat{\omega}^2  \\
+       z & = (\hat{\alpha} - 1) - T \hat{\omega}^2_1 / \sum_{t=2}^T \hat{u}^2
+
+    :math:`\hat{\omega}^2_1` is an estimate of the one-sided strict
+    autocovariance and :math:`\hat{\omega}^2` is an estimate of the long-run
+    variance of the process.
+
+    The Pu statistic is defined as
+
+    .. math:: P_u = T \hat{\omega}_{11\cdot2} / \sum_{t=1}^T \hat{u}^2
+
+    where
+
+    .. math:: \hat{\omega}_{11\cdot 2} = \hat{\omega}_{11}
+              - \hat{\omega}'_{21} \hat{\Omega}_{22}^{-1} \hat{\omega}_{21}
+
+    and
+
+    .. math:: \hat{\Omega} = \begin{array}{cc}{\hat{\omega}_{11} & \hat{\omega}'_{21} \\
+                                               \hat{\omega}_{21} & \hat{\Omega}_{22} \end{array}
+
+    is an estimate of the long-run of :math:`\xi_t`, the residuals from
+    estimating a VAR(1) on :math:`Z=[Y,X]` that includes and trends included
+    in the test.
+
+    .. math::
+
+       Z_t = \Phi Z_{t-1} + \xi_t
+
+    The final test statistic is defined
+
+    .. math::
+
+       P_z = T \mathrm{trace}(\hat{\Omega} M_{zz}^{-1})
+
+    where :math:`M_{zz} = \sum_{t=1}^T \tilde{z}'_t \tilde{z}_t`,
+    :math:`\tilde{z}_t` is the vector of data :math:`z=[y,x]` detrended
+    using and trend terms included in the test, and :math:`\hat{\Omega}`
+    is defined above.
+    """
+    test_type = test_type.lower()
+    if test_type not in ("za", "zt", "pu", "pz"):
+        raise ValueError(
+            f"Unknown test_type: {test_type}. Only Za, Zt, Pu and Pz are supported."
+        )
+    kernel = kernel.lower().replace("-", "").replace("_", "")
+    if kernel not in KERNEL_ESTIMATORS:
+        raise ValueError(KERNEL_ERR)
+    y = ensure2d(y, "y")
+    x = ensure2d(x, "x")
+    xsection = _cross_section(y, x, trend)
+    if test_type in ("pu", "pz"):
+        data = xsection.model.data
+        x_df = data.orig_exog.iloc[:, : x.shape[1]]
+        z = pd.concat([data.orig_endog, x_df], axis=1)
+        return _po_ptests(z, xsection, trend, test_type, kernel, bandwidth, force_int)
+    return _po_ztests(xsection, test_type, kernel, bandwidth, force_int)
+
+
 class CointegrationTestResult(object):
     """
     Base results class for cointegration tests.
@@ -228,33 +442,7 @@ class CointegrationTestResult(object):
         return self.__str__() + f"\nID: {hex(id(self))}"
 
 
-class EngleGrangerCointegrationTestResult(CointegrationTestResult):
-    """
-    Results class for Engle-Granger cointegration tests.
-
-    Parameters
-    ----------
-    stat : float
-        The Engle-Granger test statistic.
-    pvalue : float
-        The pvalue of the Engle-Granger test statistic.
-    crit_vals : Series
-        The critical values of the Engle-Granger specific to the sample size
-        and model dimension.
-    null : str
-        The null hypothesis.
-    alternative : str
-        The alternative hypothesis.
-    trend : str
-        The model's trend description.
-    order : int
-        The number of stochastic trends in the null distribution.
-    adf : ADF
-        The ADF instance used to perform the test and lag selection.
-    xsection : RegressionResults
-        The OLS results used in the cross-sectional regression.
-    """
-
+class _ResidualCointegrationTestResult(CointegrationTestResult):
     def __init__(
         self,
         stat: float,
@@ -264,61 +452,20 @@ class EngleGrangerCointegrationTestResult(CointegrationTestResult):
         alternative: str = "Cointegration",
         trend: str = "c",
         order: int = 2,
-        adf: Optional[ADF] = None,
         xsection: Optional[RegressionResults] = None,
     ) -> None:
         super().__init__(stat, pvalue, crit_vals, null, alternative)
-        self.name = "Engle-Granger Cointegration Test"
-        assert adf is not None
-        self._adf = adf
+        self.name = "NONE"
         assert xsection is not None
         self._xsection = xsection
         self._order = order
         self._trend = trend
-        self._additional_info = {
-            "ADF Lag length": self.lags,
-            "Trend": self.trend,
-            "Estimated Root ρ (γ+1)": self.rho,
-            "Distribution Order": self.distribution_order,
-        }
+        self._additional_info = {}
 
     @property
     def trend(self) -> str:
         """The trend used in the cointegrating regression"""
         return self._trend
-
-    @property
-    def lags(self) -> int:
-        """The number of lags used in the Augmented Dickey-Fuller regression."""
-        return self._adf.lags
-
-    @property
-    def max_lags(self) -> Optional[int]:
-        """The maximum number of lags used in the lag-length selection."""
-        return self._adf.max_lags
-
-    @property
-    def rho(self) -> float:
-        r"""
-        The estimated coefficient in the Dickey-Fuller Test
-
-        Returns
-        -------
-        float
-            The coefficient.
-
-        Notes
-        -----
-        The value returned is :math:`\hat{\rho}=\hat{\gamma}+1` from the ADF
-        regression
-
-        .. math::
-
-            \Delta y_t = \gamma y_{t-1} + \sum_{i=1}^p \delta_i \Delta y_{t-i}
-                         + \epsilon_t
-        """
-
-        return 1 + self._adf.regression.params[0]
 
     @property
     def distribution_order(self) -> int:
@@ -370,6 +517,101 @@ class EngleGrangerCointegrationTestResult(CointegrationTestResult):
         return fig
 
     def summary(self) -> Summary:
+        return Summary()
+
+    def _repr_html_(self) -> str:
+        """Display as HTML for IPython notebook."""
+        return self.summary().as_html()
+
+
+class EngleGrangerCointegrationTestResult(_ResidualCointegrationTestResult):
+    """
+    Results class for Engle-Granger cointegration tests.
+
+    Parameters
+    ----------
+    stat : float
+        The Engle-Granger test statistic.
+    pvalue : float
+        The pvalue of the Engle-Granger test statistic.
+    crit_vals : Series
+        The critical values of the Engle-Granger specific to the sample size
+        and model dimension.
+    null : str
+        The null hypothesis.
+    alternative : str
+        The alternative hypothesis.
+    trend : str
+        The model's trend description.
+    order : int
+        The number of stochastic trends in the null distribution.
+    adf : ADF
+        The ADF instance used to perform the test and lag selection.
+    xsection : RegressionResults
+        The OLS results used in the cross-sectional regression.
+    """
+
+    def __init__(
+        self,
+        stat: float,
+        pvalue: float,
+        crit_vals: pd.Series,
+        null: str = "No Cointegration",
+        alternative: str = "Cointegration",
+        trend: str = "c",
+        order: int = 2,
+        adf: Optional[ADF] = None,
+        xsection: Optional[RegressionResults] = None,
+    ) -> None:
+        super().__init__(
+            stat, pvalue, crit_vals, null, alternative, trend, order, xsection
+        )
+        self.name = "Engle-Granger Cointegration Test"
+        assert adf is not None
+        self._adf = adf
+        self._additional_info.update(
+            {
+                "ADF Lag length": self.lags,
+                "Trend": self.trend,
+                "Estimated Root ρ (γ+1)": self.rho,
+                "Distribution Order": self.distribution_order,
+            }
+        )
+
+    @property
+    def lags(self) -> int:
+        """The number of lags used in the Augmented Dickey-Fuller regression."""
+        return self._adf.lags
+
+    @property
+    def max_lags(self) -> Optional[int]:
+        """The maximum number of lags used in the lag-length selection."""
+        return self._adf.max_lags
+
+    @property
+    def rho(self) -> float:
+        r"""
+        The estimated coefficient in the Dickey-Fuller Test
+
+        Returns
+        -------
+        float
+            The coefficient.
+
+        Notes
+        -----
+        The value returned is :math:`\hat{\rho}=\hat{\gamma}+1` from the ADF
+        regression
+
+        .. math::
+
+            \Delta y_t = \gamma y_{t-1} + \sum_{i=1}^p \delta_i \Delta y_{t-i}
+                         + \epsilon_t
+        """
+
+        return 1 + self._adf.regression.params[0]
+
+    def summary(self) -> Summary:
         """Summary of test, containing statistic, p-value and critical values"""
         table_data = [
             ("Test Statistic", f"{self.stat:0.3f}"),
@@ -411,9 +653,46 @@ class EngleGrangerCointegrationTestResult(CointegrationTestResult):
         smry.add_extra_txt(extra_text)
         return smry
 
-    def _repr_html_(self) -> str:
-        """Display as HTML for IPython notebook."""
-        return self.summary().as_html()
+
+class PhillipsOuliarisCointegrationTestResult(_ResidualCointegrationTestResult):
+    def __init__(
+        self,
+        stat: float,
+        pvalue: float,
+        crit_vals: pd.Series,
+        null: str = "No Cointegration",
+        alternative: str = "Cointegration",
+        trend: str = "c",
+        order: int = 2,
+        xsection: Optional[RegressionResults] = None,
+        test_type: str = "Za",
+        kernel_est: Optional[lrcov.CovarianceEstimator] = None,
+    ) -> None:
+        super().__init__(
+            stat, pvalue, crit_vals, null, alternative, trend, order, xsection=xsection
+        )
+        self.name = f"Phillips-Ouliaris {test_type} Cointegration Test"
+        self._test_type = test_type
+        assert kernel_est is not None
+        self._kernel_est = kernel_est
+        self._additional_info.update(
+            {
+                "Kernel": self.kernel,
+                "Bandwidth": str_format(kernel_est.bandwidth),
+                "Trend": self.trend,
+                "Distribution Order": self.distribution_order,
+            }
+        )
+
+    @property
+    def kernel(self) -> str:
+        """Name of the long-run covariance estimator"""
+        return self._kernel_est.__class__.__name__
+
+    @property
+    def bandwidth(self) -> float:
+        """Bandwidth used by the long-run covariance estimator"""
+        return self._kernel_est.bandwidth
 
 
 def engle_granger_cv(trend: str, num_x: int, nobs: int) -> pd.Series:
@@ -1106,17 +1385,14 @@ class DynamicOLS(object):
         resids: pd.Series,
     ) -> Tuple[pd.DataFrame, lrcov.CovarianceEstimator]:
         """Estimate the covariance"""
+        kernel = kernel.lower().replace("-", "").replace("_", "")
+        if kernel not in KERNEL_ESTIMATORS:
+            raise ValueError(KERNEL_ERR)
         x = np.asarray(rhs)
         eps = ensure2d(np.asarray(resids), "eps")
         nobs, nx = x.shape
         sigma_xx = x.T @ x / nobs
         sigma_xx_inv = np.linalg.inv(sigma_xx)
-        kernel = kernel.lower().replace("-", "")
-        if kernel not in KERNEL_ESTIMATORS:
-            estimators = "\n".join(sorted([k for k in KERNEL_ESTIMATORS]))
-            raise ValueError(
-                f"kernel is not a known kernel estimator. Must be one of:\n {estimators}"
-            )
         kernel_est = KERNEL_ESTIMATORS[kernel]
         scale = nobs / (nobs - nx) if df_adjust else 1.0
         if cov_type in ("unadjusted", "homoskedastic"):
