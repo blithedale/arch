@@ -47,6 +47,13 @@ TRUE_BW_FROM_R_PA = 7.75328
 TRUE_BW_FROM_R_QS = 3.851586
 
 
+@pytest.fixture
+def inflation():
+    data = dataset_loader(macrodata)
+    cpi = log(data["cpi"])
+    return diff(cpi)
+
+
 class TestUnitRoot(object):
     @classmethod
     def setup_class(cls):
@@ -161,9 +168,14 @@ class TestUnitRoot(object):
         lags = ceil(12.0 * ((n / 100.0) ** (1.0 / 4.0)))
         assert_equal(pp.lags, lags)
         assert_almost_equal(pp.stat, -8.135547778, DECIMAL_4)
+        assert "tau" in str(pp)
+        assert "tau" in repr(pp)
+
         with pytest.warns(FutureWarning, match="Mutating unit root"):
             pp.test_type = "rho"
         assert_almost_equal(pp.stat, -118.7746451, DECIMAL_2)
+        assert "rho" in str(pp)
+        assert "rho" in repr(pp)
 
     def test_dfgls_c(self):
         dfgls = DFGLS(self.inflation, trend="c", lags=0)
@@ -679,6 +691,14 @@ def test_phillips_perron_specifed_lag():
     y = np.zeros((10,))
     with pytest.raises(InfeasibleTestException, match="A minimum of 12 observations"):
         assert np.isfinite(PhillipsPerron(y, lags=12).stat)
+
+
+@pytest.mark.parametrize("trend", ["n", "c", "ct"])
+@pytest.mark.parametrize("test_type", ["tau", "rho"])
+def test_phillips_perron_str_repr(inflation, test_type, trend):
+    pp = PhillipsPerron(inflation, lags=12, test_type=test_type, trend=trend)
+    assert isinstance(pp.stat, float)
+    assert test_type in str(pp)
 
 
 def test_kpss_legacy():

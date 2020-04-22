@@ -335,11 +335,11 @@ tau_max = {
 }
 
 # Z values from MacKinnon(1994), tables 5 and 6
-adf_z_max = {"c": inf, "ct": inf, "ctt": inf}
+adf_z_max = {"n": inf, "c": inf, "ct": inf, "ctt": inf}
 
-adf_z_min = {"c": -22.03, "ct": -32.85, "ctt": -41.18}
+adf_z_min = {"n": -inf, "c": -22.03, "ct": -32.85, "ctt": -41.18}
 
-adf_z_star = {"c": -7.96, "ct": -13.46, "ctt": -16.27}
+adf_z_star = {"n": -2.9, "c": -7.96, "ct": -13.46, "ctt": -16.27}
 
 adf_z_small_p = {
     "n": [0.0342, -0.6376, 0, -0.03872],
